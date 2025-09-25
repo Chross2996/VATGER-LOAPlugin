@@ -1,3 +1,3 @@
-# ESSquawks
+# LOA Plugin
 
-Display a message when aircraft have a specific squawk set.
+Reliable LOA XFL and COP display based on sector configuration.
