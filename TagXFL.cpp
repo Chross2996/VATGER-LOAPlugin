@@ -2,11 +2,130 @@
 #include "LOAPlugin.h"
 #include <string>
 #include <algorithm>
-#include <climits>      // for INT_MIN
+#include <climits>
 #include <unordered_map>
 #include <unordered_set>
 
-#define DEBUG_MSG(title, msg) plugin.DisplayUserMessage("LOA DEBUG", title, msg, true, true, false, false, false);
+static bool IsAcceptedAltitudeStateXFL(int state)
+{
+    return state == COORDINATION_STATE_ACCEPTED ||
+        state == COORDINATION_STATE_MANUAL_ACCEPTED;
+}
+
+static void FormatFL3(char sItemString[16], int altitudeFeet)
+{
+    int fl = altitudeFeet;
+    if (fl > 1000) fl /= 100; // feet -> FL text
+    _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", fl);
+}
+
+namespace {
+    struct XflCoordHeuristicState {
+        int baselineValue = 0;
+        int pendingValue = 0;
+        bool hasBaseline = false;
+        bool pendingActive = false;
+    };
+
+    static std::unordered_map<std::string, XflCoordHeuristicState> g_xflHeuristic;
+}
+
+static bool TryGetLiveCoordAltitude(
+    EuroScopePlugIn::CFlightPlan flightPlan,
+    int& outAlt,
+    int& outState)
+{
+    const std::string callsign = flightPlan.GetCallsign();
+    XflCoordHeuristicState& st = g_xflHeuristic[callsign];
+
+    outAlt = flightPlan.GetExitCoordinationAltitude();
+    outState = flightPlan.GetExitCoordinationAltitudeState();
+
+    // Explicit refusal: abandon the pending request and fall back immediately.
+    if (outState == COORDINATION_STATE_REFUSED) {
+        st.pendingActive = false;
+        st.pendingValue = 0;
+        if (outAlt >= 500) {
+            st.baselineValue = outAlt;
+            st.hasBaseline = true;
+        }
+        return false;
+    }
+
+    // Pending request: remember and show the requested altitude.
+    if (outState == COORDINATION_STATE_REQUESTED_BY_ME ||
+        outState == COORDINATION_STATE_REQUESTED_BY_OTHER)
+    {
+        if (outAlt >= 500) {
+            st.pendingValue = outAlt;
+            st.pendingActive = true;
+            return true;
+        }
+        return false;
+    }
+
+    // Explicit accepted/manual accepted: show it and keep the same pending value for the later NONE check.
+    if (IsAcceptedAltitudeStateXFL(outState) && outAlt >= 500) {
+        st.pendingValue = outAlt;
+        st.pendingActive = true;
+        return true;
+    }
+
+    // NONE before any active coordination: learn baseline but do not display it.
+    if (outState == COORDINATION_STATE_NONE && !st.pendingActive) {
+        if (outAlt >= 500) {
+            st.baselineValue = outAlt;
+            st.hasBaseline = true;
+        }
+        return false;
+    }
+
+    // NONE after a coordination cycle: compare the lingering value.
+    if (outState == COORDINATION_STATE_NONE && st.pendingActive) {
+        if (outAlt >= 500 && st.pendingValue >= 500 && outAlt == st.pendingValue) {
+            // Request value survived into NONE -> treat as accepted.
+            outAlt = st.pendingValue;
+            outState = COORDINATION_STATE_ACCEPTED;
+            return true;
+        }
+
+        const bool revertedToBaseline =
+            (outAlt >= 500 && st.hasBaseline && outAlt == st.baselineValue);
+
+        // Empty, baseline, or any unexpected value -> stop showing coordination and fall back.
+        if (outAlt < 500 || revertedToBaseline || outAlt != st.pendingValue) {
+            st.pendingActive = false;
+            st.pendingValue = 0;
+            if (outAlt >= 500) {
+                st.baselineValue = outAlt;
+                st.hasBaseline = true;
+            }
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static void ApplyPendingColorOnly(
+    EuroScopePlugIn::CRadarTarget radarTarget,
+    int state,
+    int* pColorCode)
+{
+    const bool isListContext = !radarTarget.IsValid();
+    if (isListContext || !pColorCode) return;
+
+    if (state == COORDINATION_STATE_REQUESTED_BY_ME) {
+        *pColorCode = TAG_COLOR_ONGOING_REQUEST_FROM_ME;
+    }
+    else if (state == COORDINATION_STATE_REQUESTED_BY_OTHER) {
+        *pColorCode = TAG_COLOR_ONGOING_REQUEST_TO_ME;
+    }
+    else {
+        *pColorCode = TAG_COLOR_DEFAULT;
+    }
+}
+
 // Tagged/Untagged XFL Tag Item
 void RenderXFLTagItem(
     EuroScopePlugIn::CFlightPlan flightPlan,
@@ -17,138 +136,89 @@ void RenderXFLTagItem(
     COLORREF* pRGB,
     double* pFontSize)
 {
-    // Validity only
     if (!flightPlan.IsValid()) {
         sItemString[0] = '\0';
         return;
     }
 
-    // ✅ Normal XFL tag only when ASSUMED
-    if (flightPlan.GetState() != FLIGHT_PLAN_STATE_ASSUMED) {
+    switch (flightPlan.GetState()) {
+    case FLIGHT_PLAN_STATE_ASSUMED:
+    case FLIGHT_PLAN_STATE_NOTIFIED:
+    case FLIGHT_PLAN_STATE_COORDINATED:
+    case FLIGHT_PLAN_STATE_TRANSFER_TO_ME_INITIATED:
+        break;
+    default:
         sItemString[0] = '\0';
         return;
     }
 
     const auto& fpd = flightPlan.GetFlightPlanData();
-    if (_stricmp(fpd.GetPlanType(), "I") != 0) { // IFR only
+    if (_stricmp(fpd.GetPlanType(), "I") != 0) {
         sItemString[0] = '\0';
         return;
     }
 
-    // Use per-frame cached data prepared in LOAPlugin::OnGetTagItem
     const auto& data = plugin.lastTagData;
     const LOAEntry* matched = plugin.currentFrameMatchedEntry;
-    const std::string& callsign = data.callsign;
     int clearedAltitude = data.clearedAltitude;
     int finalAltitude = data.finalAltitude;
 
-    // If destination is in AOR but none of the AOR host sectors (e.g., HAM/HAMW) are online,
-   // hide the normal XFL tag. If HAM is online, do NOT hide (show normal LOA behavior).
     if (plugin.IsAORDestination(plugin.lastTagData.destination) &&
-        !plugin.IsAnyAORHostOnline(plugin.currentFrameOnlineControllers)) {
+        plugin.IsAnyAORHostOnline(plugin.currentFrameOnlineControllers)) {
         sItemString[0] = '\0';
         return;
     }
 
-    // ---------------- Coordination overrides (unchanged) ----------------
-    int coordXFL = flightPlan.GetExitCoordinationAltitude();
-    int coordState = flightPlan.GetExitCoordinationAltitudeState();
+    // 1) Active live coordination altitude shows directly.
+    int coordAlt = 0, coordState = COORDINATION_STATE_NONE;
+    if (TryGetLiveCoordAltitude(flightPlan, coordAlt, coordState)) {
+        ApplyPendingColorOnly(radarTarget, coordState, pColorCode);
 
-    if ((coordState == COORDINATION_STATE_REQUESTED_BY_ME || coordState == COORDINATION_STATE_REQUESTED_BY_OTHER) && coordXFL >= 500) {
-        plugin.coordinationStates[callsign].exitAltitude = coordXFL;
-        plugin.coordinationStates[callsign].exitAltitudeState = COORDINATION_STATE_REQUESTED_BY_ME;
-    }
-    if (coordState == COORDINATION_STATE_NONE) {
-        const auto it = plugin.coordinationStates.find(callsign);
-        if (it != plugin.coordinationStates.end()) {
-            const auto& info = it->second;
-            if (info.exitAltitude >= 500 && info.exitAltitude == coordXFL && info.exitAltitudeState == COORDINATION_STATE_REQUESTED_BY_ME) {
-                _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-                return;
-            }
-        }
-    }
-    if (coordXFL >= 500 && coordState == COORDINATION_STATE_REQUESTED_BY_ME) {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-        if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_FROM_ME;
-        return;
-    }
-    if (coordXFL >= 500 && coordState == COORDINATION_STATE_REQUESTED_BY_OTHER) {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-        if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_TO_ME;
-        return;
-    }
-    if (coordXFL >= 500 && coordState == COORDINATION_STATE_REFUSED) {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-        if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_REFUSED;
-        return;
-    }
-    // --------------------------------------------------------------------
-
-    // ---------- Simple XFL tag policy using the cached match only ----------
-    if (matched) {
-        const bool isDeparture = !matched->originAirports.empty();
-        const bool isArrival = !matched->destinationAirports.empty();
-        const int  xflFeet = matched->xfl * 100;
-
-        if (isArrival) {
-            // Arrival (simple tag):
-            // - if CFL <= XFL → blank
-            // - if CFL >  XFL → show XFL value
-            if (clearedAltitude <= xflFeet) {
-                sItemString[0] = '\0';
-                return;
-            }
-            else {
-                _snprintf_s(sItemString, 16, _TRUNCATE, "%d", matched->xfl);
-                return;
-            }
-        }
-
-        // Departure (simple tag):
-        // - if CFL < XFL and FNL > XFL → show XFL
-        // - if CFL == XFL → blank
-        // - if CFL > XFL  → show final altitude
-        if (isDeparture) {
-            if (clearedAltitude < xflFeet && finalAltitude > xflFeet) {
-                _snprintf_s(sItemString, 16, _TRUNCATE, "%d", matched->xfl);
-                return;
-            }
-            if (clearedAltitude == xflFeet) {
-                sItemString[0] = '\0';
-                return;
-            }
-            if (clearedAltitude > xflFeet) {
-                if (clearedAltitude == finalAltitude) {
-                    sItemString[0] = '\0';
-                }
-                else {
-                    _snprintf_s(sItemString, 16, _TRUNCATE, "%d", finalAltitude / 100);
-                }
-                return;
-            }
-        }
-
-        // Generic fall-through for departure when above did not return:
-        if (clearedAltitude == finalAltitude) {
+        // Only hide when coord altitude equals cleared altitude
+        if (coordAlt == clearedAltitude) {
             sItemString[0] = '\0';
             return;
         }
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%d", finalAltitude / 100);
+
+        FormatFL3(sItemString, coordAlt);
         return;
     }
-    // -----------------------------------------------------------------------
 
-    // No LOA match: default to final altitude display policy
+    // 2) LOA match path.
+    if (matched) {
+        if (!matched->xflText.empty()) {
+            strncpy_s(sItemString, 16, matched->xflText.c_str(), _TRUNCATE);
+            return;
+        }
+
+        if (matched->xfl == 0) {
+            sItemString[0] = '\0';
+            return;
+        }
+
+        const int loaXflFeet = matched->xfl * 100;
+
+        // If a LOA matched, only hide when the cleared altitude equals the matched LOA value.
+        if (clearedAltitude == loaXflFeet) {
+            sItemString[0] = '\0';
+            return;
+        }
+
+        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", matched->xfl);
+        return;
+    }
+
+    // 3) No LOA match -> final altitude fallback.
+    // Only in the no-match case do we hide when cleared altitude equals final altitude.
     if (clearedAltitude == finalAltitude) {
         sItemString[0] = '\0';
+        return;
     }
-    else {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%d", finalAltitude / 100);
-    }
+
+    FormatFL3(sItemString, finalAltitude);
 }
 
-// ✅ Detailed XFL tag — prefer the cached per-frame LOA match; only re-match if none cached
+// Detailed XFL tag — always show something.
 void RenderXFLDetailedTagItem(
     EuroScopePlugIn::CFlightPlan flightPlan,
     EuroScopePlugIn::CRadarTarget radarTarget,
@@ -158,15 +228,13 @@ void RenderXFLDetailedTagItem(
     COLORREF* pRGB,
     double* pFontSize)
 {
-
     if (!flightPlan.IsValid() || !plugin.IsLOARelevantState(flightPlan.GetState())) {
         strncpy_s(sItemString, 16, "XFL", _TRUNCATE);
         return;
     }
 
-    // keep this cleanup for non-concerned frames
     if (flightPlan.GetState() == FLIGHT_PLAN_STATE_NON_CONCERNED) {
-        plugin.coordinationStates.erase(flightPlan.GetCallsign());
+        strncpy_s(sItemString, 16, "XFL", _TRUNCATE);
         return;
     }
 
@@ -177,230 +245,38 @@ void RenderXFLDetailedTagItem(
     }
 
     const auto& data = plugin.lastTagData;
-    const std::string& callsign = data.callsign;
-    int clearedAltitude = data.clearedAltitude;
     int finalAltitude = data.finalAltitude;
-    const std::string& origin = data.origin;
-    const std::string& destination = data.destination;
 
-    const auto& onlineControllers = plugin.currentFrameOnlineControllers;
-    const auto& routePoints = plugin.currentFrameRoutePoints;
-
-    // If destination is in AOR and no AOR host sector is online, force literal "XFL".
-   // If HAM/HAMW is online, skip this override so LOAs render normally.
     if (plugin.IsAORDestination(plugin.lastTagData.destination) &&
-        !plugin.IsAnyAORHostOnline(plugin.currentFrameOnlineControllers)) {
+        plugin.IsAnyAORHostOnline(plugin.currentFrameOnlineControllers)) {
         strncpy_s(sItemString, 16, "XFL", _TRUNCATE);
         return;
     }
 
-    // ---------------- Coordination handling (unchanged) ----------------
-    int coordXFL = flightPlan.GetExitCoordinationAltitude();
-    int coordState = flightPlan.GetExitCoordinationAltitudeState();
+    int coordAlt = 0, coordState = COORDINATION_STATE_NONE;
+    if (TryGetLiveCoordAltitude(flightPlan, coordAlt, coordState)) {
+        ApplyPendingColorOnly(radarTarget, coordState, pColorCode);
+        FormatFL3(sItemString, coordAlt);
+        return;
+    }
 
-    if ((coordState == COORDINATION_STATE_REQUESTED_BY_ME || coordState == COORDINATION_STATE_REQUESTED_BY_OTHER) && coordXFL >= 500) {
-        plugin.coordinationStates[callsign].exitAltitude = coordXFL;
-        plugin.coordinationStates[callsign].exitAltitudeState = COORDINATION_STATE_REQUESTED_BY_ME;
-    }
-    if (coordState == COORDINATION_STATE_NONE) {
-        const auto it = plugin.coordinationStates.find(callsign);
-        if (it != plugin.coordinationStates.end()) {
-            const auto& info = it->second;
-            if (info.exitAltitude >= 500 && info.exitAltitude == coordXFL && info.exitAltitudeState == COORDINATION_STATE_REQUESTED_BY_ME) {
-                _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-                if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_ACCEPTED;
-                return;
-            }
-        }
-    }
-    if (coordXFL >= 500 && coordState == COORDINATION_STATE_REQUESTED_BY_ME) {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-        if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_FROM_ME;
-        return;
-    }
-    if (coordXFL >= 500 && coordState == COORDINATION_STATE_REQUESTED_BY_OTHER) {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-        if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_TO_ME;
-        return;
-    }
-    if (coordXFL >= 500 && coordState == COORDINATION_STATE_REFUSED) {
-        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", coordXFL / 100);
-        if (pColorCode) *pColorCode = TAG_COLOR_ONGOING_REQUEST_REFUSED;
-        return;
-    }
-    // -------------------------------------------------------------------
-
-    // === Prefer the cached per-frame match; only re-scan if missing ===
     const LOAEntry* finalMatch = plugin.currentFrameMatchedEntry;
-    bool            isDepartureSel = (finalMatch && !finalMatch->originAirports.empty());
-
-    auto shouldMatchLOA = [&](const std::vector<std::string>& nextSectors) -> bool {
-        std::string mySector = plugin.ControllerMyself().GetPositionId();
-
-        for (const std::string& next : nextSectors) {
-            bool nextIsDefined = plugin.sectorOwnership.find(next) != plugin.sectorOwnership.end();
-            const auto& owned = plugin.sectorOwnership[mySector];
-            bool iOwnNext = std::find(owned.begin(), owned.end(), next) != owned.end();
-            std::string actualController = plugin.ResolveControllingSector(next, onlineControllers);
-
-            if (_stricmp(actualController.c_str(), mySector.c_str()) == 0)
-                return false;  // I control it
-
-            if (nextIsDefined) {
-                if (actualController.empty() && iOwnNext)
-                    return false;
-
-                const auto& prioList = plugin.sectorPriority[next];
-                auto myPrio = std::find(prioList.begin(), prioList.end(), mySector);
-                auto actualPrio = std::find(prioList.begin(), prioList.end(), actualController);
-                if (myPrio != prioList.end() && actualPrio != prioList.end() && actualPrio < myPrio)
-                    return false;
-
-                return true;
-            }
-
-            // external sector
-            if (!nextIsDefined && actualController.empty()) {
-                return true;  // no one online there → allow
-            }
-            if (!nextIsDefined && !_stricmp(actualController.c_str(), mySector.c_str())) {
-                return false; // I control it
-            }
-            return true;      // external and someone else online
-        }
-
-        return false;
-        };
-
-    auto matches = [&](const LOAEntry& entry) -> bool {
-        if (!entry.nextSectors.empty() && !shouldMatchLOA(entry.nextSectors)) return false;
-
-        bool originMatch = entry.originAirports.empty() ||
-            plugin.MatchesAirport(entry.originAirportSet, entry.originAirportPrefixes, origin);
-        bool destMatch = entry.destinationAirports.empty() ||
-            plugin.MatchesAirport(entry.destinationAirportSet, entry.destinationAirportPrefixes, destination);
-
-        bool wpMatch = std::all_of(entry.waypoints.begin(), entry.waypoints.end(),
-            [&](const std::string& wp) {
-                return std::any_of(routePoints.begin(), routePoints.end(),
-                    [&](const std::string& r) { return _stricmp(r.c_str(), wp.c_str()) == 0; });
-            });
-
-        return originMatch && destMatch && wpMatch;
-        };
-
-    auto isSourceSectorSuppressed = [&](const LOAEntry& e) -> bool {
-        if (e.sectors.empty()) return false;
-        std::string my = plugin.ControllerMyself().GetPositionId();
-        std::unordered_map<std::string, std::string> resolveCache;
-
-        for (const auto& src : e.sectors) {
-            std::string actual;
-            auto it = resolveCache.find(src);
-            if (it != resolveCache.end()) actual = it->second;
-            else {
-                actual = plugin.ResolveControllingSector(src, onlineControllers);
-                resolveCache[src] = actual;
-            }
-
-            if (actual.empty()) continue;
-            if (_stricmp(actual.c_str(), my.c_str()) == 0) continue;
-
-            const auto& prio = plugin.sectorPriority[src];
-            auto meIt = std::find(prio.begin(), prio.end(), my);
-            auto himIt = std::find(prio.begin(), prio.end(), actual);
-            if (meIt != prio.end() && himIt != prio.end() && himIt < meIt) {
-                return true;
-            }
-        }
-        return false;
-        };
-
-    auto scoreEntry = [&](const LOAEntry& e, bool isDepartureList) -> int {
-        int score = 0;
-        if (!isDepartureList) score += 20;
-
-        std::string mySector = plugin.ControllerMyself().GetPositionId();
-        if (!e.nextSectors.empty()) {
-            for (const auto& next : e.nextSectors) {
-                std::string actual = plugin.ResolveControllingSector(next, onlineControllers);
-                if (!actual.empty()) {
-                    if (_stricmp(actual.c_str(), mySector.c_str()) == 0) {
-                        score -= 10000; // I control it → strongly deprioritize
-                    }
-                    else {
-                        const auto& prio = plugin.sectorPriority[next];
-                        auto meIt = std::find(prio.begin(), prio.end(), mySector);
-                        auto himIt = std::find(prio.begin(), prio.end(), actual);
-                        if (meIt != prio.end() && himIt != prio.end() && himIt < meIt) {
-                            score += 50;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        return score;
-        };
-
-    // Only re-match if cached is missing
     if (!finalMatch) {
-        const LOAEntry* bestDep = nullptr; int depScore = INT_MIN;
-        const LOAEntry* bestDest = nullptr; int destScore = INT_MIN;
-
-        for (const auto& e : departureLoas) {
-            if (isSourceSectorSuppressed(e)) continue;
-            if (matches(e)) {
-                int s = scoreEntry(e, /*isDepartureList=*/true);
-                if (s > depScore) { depScore = s; bestDep = &e; }
-            }
-        }
-        for (const auto& e : destinationLoas) {
-            if (isSourceSectorSuppressed(e)) continue;
-            if (matches(e)) {
-                int s = scoreEntry(e, /*isDepartureList=*/false);
-                if (s > destScore || (s == destScore && bestDest && e.xfl > bestDest->xfl)) {
-                    destScore = s; bestDest = &e;
-                }
-            }
-        }
-
-        if (bestDest && (!bestDep || destScore >= depScore)) {
-            finalMatch = bestDest;
-            isDepartureSel = false;
-        }
-        else if (bestDep) {
-            finalMatch = bestDep;
-            isDepartureSel = true;
-        }
+        finalMatch = MatchLoaEntry(flightPlan, plugin.currentFrameOnlineControllers);
     }
 
-    // ---- Display using finalMatch (detailed rules) ----
     if (finalMatch) {
-        const bool isArrivalSel = !finalMatch->destinationAirports.empty();
-        const int  xflFeet = finalMatch->xfl * 100;
-
-        // AFTER: Only below XFL shows "XFL" on arrivals
-        if (isArrivalSel && clearedAltitude < xflFeet) {
+        if (!finalMatch->xflText.empty()) {
+            strncpy_s(sItemString, 16, finalMatch->xflText.c_str(), _TRUNCATE);
+            return;
+        }
+        if (finalMatch->xfl == 0) {
             strncpy_s(sItemString, 16, "XFL", _TRUNCATE);
             return;
         }
-
-        if ((isDepartureSel && clearedAltitude < xflFeet && finalAltitude > xflFeet) ||
-            (isArrivalSel && clearedAltitude > xflFeet)) {
-            strncpy_s(sItemString, 16, std::to_string(finalMatch->xfl).c_str(), _TRUNCATE);
-            return;
-        }
-        else if (clearedAltitude == finalAltitude) {
-            strncpy_s(sItemString, 16, std::to_string(finalAltitude / 100).c_str(), _TRUNCATE);
-            return;
-        }
-        else if (clearedAltitude == xflFeet) {
-            strncpy_s(sItemString, 16, std::to_string(finalMatch->xfl).c_str(), _TRUNCATE);
-            return;
-        }
+        _snprintf_s(sItemString, 16, _TRUNCATE, "%03d", finalMatch->xfl);
+        return;
     }
 
-    // Default: show RFL
-    strncpy_s(sItemString, 16, std::to_string(finalAltitude / 100).c_str(), _TRUNCATE);
+    FormatFL3(sItemString, finalAltitude);
 }
