@@ -75,6 +75,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
     <TargetName>LOAPlugin</TargetName>
+    <OutDir>..\..\VATSIM Euroscope Files\EDWW\Plugins\LOA Plugin</OutDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
@@ -172,7 +173,6 @@
     <ClCompile Include="LOAPlugin.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="LOAPlugin2.cpp" />
-    <ClCompile Include="PEL.cpp" />
     <ClCompile Include="stdafx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
