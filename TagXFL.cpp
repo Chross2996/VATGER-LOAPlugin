@@ -134,7 +134,8 @@ void RenderXFLTagItem(
     char sItemString[16],
     int* pColorCode,
     COLORREF* pRGB,
-    double* pFontSize)
+    double* pFontSize,
+    const PerAircraftFrameData& ctx)
 {
     if (!flightPlan.IsValid()) {
         sItemString[0] = '\0';
@@ -158,12 +159,12 @@ void RenderXFLTagItem(
         return;
     }
 
-    const auto& data = plugin.lastTagData;
     const LOAEntry* matched = plugin.currentFrameMatchedEntry;
-    int clearedAltitude = data.clearedAltitude;
-    int finalAltitude = data.finalAltitude;
+    if (matched && !plugin.IsLoaEntryPointerValid(matched)) matched = nullptr;
+    int clearedAltitude = ctx.clearedAltitude;
+    int finalAltitude = ctx.finalAltitude;
 
-    if (plugin.IsAORDestination(plugin.lastTagData.destination) &&
+    if (plugin.IsAORDestination(ctx.destination) &&
         plugin.IsAnyAORHostOnline(plugin.currentFrameOnlineControllers)) {
         sItemString[0] = '\0';
         return;
@@ -226,7 +227,8 @@ void RenderXFLDetailedTagItem(
     char sItemString[16],
     int* pColorCode,
     COLORREF* pRGB,
-    double* pFontSize)
+    double* pFontSize,
+    const PerAircraftFrameData& ctx)
 {
     if (!flightPlan.IsValid() || !plugin.IsLOARelevantState(flightPlan.GetState())) {
         strncpy_s(sItemString, 16, "XFL", _TRUNCATE);
@@ -244,10 +246,9 @@ void RenderXFLDetailedTagItem(
         return;
     }
 
-    const auto& data = plugin.lastTagData;
-    int finalAltitude = data.finalAltitude;
+    int finalAltitude = ctx.finalAltitude;
 
-    if (plugin.IsAORDestination(plugin.lastTagData.destination) &&
+    if (plugin.IsAORDestination(ctx.destination) &&
         plugin.IsAnyAORHostOnline(plugin.currentFrameOnlineControllers)) {
         strncpy_s(sItemString, 16, "XFL", _TRUNCATE);
         return;
@@ -261,9 +262,7 @@ void RenderXFLDetailedTagItem(
     }
 
     const LOAEntry* finalMatch = plugin.currentFrameMatchedEntry;
-    if (!finalMatch) {
-        finalMatch = MatchLoaEntry(flightPlan, plugin.currentFrameOnlineControllers);
-    }
+    if (finalMatch && !plugin.IsLoaEntryPointerValid(finalMatch)) finalMatch = nullptr;
 
     if (finalMatch) {
         if (!finalMatch->xflText.empty()) {

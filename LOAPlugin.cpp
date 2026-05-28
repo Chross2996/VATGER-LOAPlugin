@@ -15,6 +15,9 @@
 #include <cmath>
 #include <cstdlib>
 
+#pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "User32.lib")
+
 using json = nlohmann::json;
 
 static std::string AddArrowPrefix(const std::string& text)
@@ -25,6 +28,902 @@ static std::string AddArrowPrefix(const std::string& text)
 }
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+// ============================================================================
+// TopSky-style custom sector handoff popup
+// - This replaces EuroScope OpenPopupList only for the visual list.
+// - Existing behavior is preserved: ASSUME, FREE, and sector handoff.
+// ============================================================================
+
+namespace {
+    enum class CustomHandoffAction {
+        Separator = 0,
+        Assume = 1,
+        Sector = 2,
+        Release = 3,
+        // A single row that renders 4 small side-by-side mini-buttons (F T C D).
+        // Each button writes its code to flight strip annotation field 8 and releases tracking.
+        ReleaseBar = 4
+    };
+
+    static const int kReleaseBarCount = 4;
+    static const char* kReleaseBarLabels[kReleaseBarCount] = { "F", "T", "C", "D" };
+    static const char* kReleaseBarCodes[kReleaseBarCount] = { "/rf/", "/rt/", "/rc/", "/rd/" };
+
+    struct CustomHandoffRow {
+        CustomHandoffAction action = CustomHandoffAction::Separator;
+        std::string label;
+        std::string frequency;
+        std::string sectorId;
+        std::string targetCallsign;
+        std::string callsign;
+        bool disabled = false;
+    };
+
+    static HWND g_handoffPopupWnd = NULL;
+    static std::vector<CustomHandoffRow> g_handoffRows;
+    static int g_handoffHoverIndex = -1;
+    static int g_handoffHoverSubIndex = -1;  // which mini-button is hovered inside a ReleaseBar row
+    static int g_selectedReleaseSubIndex = 0; // which release type is selected (0=F default); -1 = none
+
+    struct CustomHandoffPopupStyle {
+        int popupWidth = 172;
+        int headerHeight = 42;
+        // Each selectable sector row is tall enough for two lines:
+        //   Sector ID
+        //   Frequency
+        int rowHeight = 38;
+        int popupBorder = 2;
+        int listVerticalPadding = 6;
+        int maxVisibleRows = 12;
+
+        std::string fontFace = "Consolas";
+        int headerFontSize = 16;
+        int sectorFontSize = 16;
+        int frequencyFontSize = 13;
+
+        COLORREF backgroundColor = RGB(245, 245, 245);
+        COLORREF borderColor = RGB(64, 64, 64);
+        COLORREF separatorColor = RGB(128, 128, 128);
+        COLORREF headerTextColor = RGB(0, 80, 160);
+        COLORREF normalTextColor = RGB(0, 80, 160);
+        COLORREF actionTextColor = RGB(0, 0, 0);
+        COLORREF actionBackgroundColor = RGB(235, 235, 235);
+
+        // Fill color for normal, non-hover selectable rows.
+        // This makes each sector/action row look like a pressable button.
+        COLORREF buttonBackgroundColor = RGB(230, 230, 230);
+
+        COLORREF hoverBackgroundColor = RGB(0, 0, 0);
+        COLORREF hoverTextColor = RGB(255, 255, 255);
+    };
+
+    static CustomHandoffPopupStyle g_popupStyle;
+    static bool g_popupStyleLoaded = false;
+
+    // Cached GDI font handles — created once per style load, shared across all WM_PAINT calls.
+    static HFONT g_cachedHeaderFont = NULL;
+    static HFONT g_cachedRowFont    = NULL;
+    static HFONT g_cachedFreqFont   = NULL;
+
+    static void DestroyPopupFonts()
+    {
+        if (g_cachedHeaderFont) { DeleteObject(g_cachedHeaderFont); g_cachedHeaderFont = NULL; }
+        if (g_cachedRowFont)    { DeleteObject(g_cachedRowFont);    g_cachedRowFont    = NULL; }
+        if (g_cachedFreqFont)   { DeleteObject(g_cachedFreqFont);   g_cachedFreqFont   = NULL; }
+    }
+
+    static int ClampColorByte(int v)
+    {
+        if (v < 0) return 0;
+        if (v > 255) return 255;
+        return v;
+    }
+
+
+    static void DestroyCustomHandoffPopup()
+    {
+        if (g_handoffPopupWnd && IsWindow(g_handoffPopupWnd)) {
+            KillTimer(g_handoffPopupWnd, 1001);
+            KillTimer(g_handoffPopupWnd, 1002);
+            DestroyWindow(g_handoffPopupWnd);
+        }
+
+        g_handoffPopupWnd = NULL;
+        g_handoffRows.clear();
+        g_handoffHoverIndex = -1;
+        g_handoffHoverSubIndex = -1;
+        g_selectedReleaseSubIndex = 0;
+        DestroyPopupFonts();
+    }
+
+    static COLORREF ParseHexColor(const std::string& value, COLORREF fallback)
+    {
+        std::string s = value;
+        if (!s.empty() && s[0] == '#') s = s.substr(1);
+        if (s.size() != 6) return fallback;
+        char* end = nullptr;
+        const long rgb = std::strtol(s.c_str(), &end, 16);
+        if (!end || *end != '\0') return fallback;
+        return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    }
+
+    static COLORREF ParseJsonColor(const json& value, COLORREF fallback)
+    {
+        // Preferred config format:
+        //   "backgroundColor": [245, 245, 245]
+        // Also still supports old hex format:
+        //   "backgroundColor": "#F5F5F5"
+        if (value.is_array() && value.size() >= 3 &&
+            value[0].is_number_integer() &&
+            value[1].is_number_integer() &&
+            value[2].is_number_integer())
+        {
+            const int r = ClampColorByte(value[0].get<int>());
+            const int g = ClampColorByte(value[1].get<int>());
+            const int b = ClampColorByte(value[2].get<int>());
+            return RGB(r, g, b);
+        }
+
+        if (value.is_string()) {
+            return ParseHexColor(value.get<std::string>(), fallback);
+        }
+
+        return fallback;
+    }
+
+    static void LoadCustomHandoffPopupStyle()
+    {
+        if (g_popupStyleLoaded) return;
+        g_popupStyleLoaded = true;
+
+        char dllPath[MAX_PATH];
+        GetModuleFileNameA(HINSTANCE(&__ImageBase), dllPath, sizeof(dllPath));
+        std::string basePath(dllPath);
+        size_t lastSlash = basePath.find_last_of("\\/");
+        basePath = (lastSlash != std::string::npos) ? basePath.substr(0, lastSlash) : ".";
+
+        const std::string filePath = basePath + "\\loa_configs_json\\custom_handoff_popup.json";
+        std::ifstream in(filePath.c_str());
+        if (!in.is_open()) {
+            // Optional file. Defaults are used if it is missing.
+            return;
+        }
+
+        try {
+            json j;
+            in >> j;
+
+            auto readInt = [&](const char* key, int& out) {
+                if (j.contains(key) && j[key].is_number_integer()) out = j[key].get<int>();
+                };
+            auto readString = [&](const char* key, std::string& out) {
+                if (j.contains(key) && j[key].is_string()) out = j[key].get<std::string>();
+                };
+            auto readColor = [&](const char* key, COLORREF& out) {
+                if (j.contains(key)) out = ParseJsonColor(j[key], out);
+                };
+
+            readInt("popupWidth", g_popupStyle.popupWidth);
+            readInt("headerHeight", g_popupStyle.headerHeight);
+            readInt("rowHeight", g_popupStyle.rowHeight);
+            readInt("popupBorder", g_popupStyle.popupBorder);
+            readInt("listVerticalPadding", g_popupStyle.listVerticalPadding);
+            readInt("maxVisibleRows", g_popupStyle.maxVisibleRows);
+
+            readString("fontFace", g_popupStyle.fontFace);
+            readInt("headerFontSize", g_popupStyle.headerFontSize);
+            readInt("sectorFontSize", g_popupStyle.sectorFontSize);
+            readInt("frequencyFontSize", g_popupStyle.frequencyFontSize);
+
+            readColor("backgroundColor", g_popupStyle.backgroundColor);
+            readColor("borderColor", g_popupStyle.borderColor);
+            readColor("separatorColor", g_popupStyle.separatorColor);
+            readColor("headerTextColor", g_popupStyle.headerTextColor);
+            readColor("normalTextColor", g_popupStyle.normalTextColor);
+            readColor("actionTextColor", g_popupStyle.actionTextColor);
+            readColor("actionBackgroundColor", g_popupStyle.actionBackgroundColor);
+            readColor("buttonBackgroundColor", g_popupStyle.buttonBackgroundColor);
+            readColor("hoverBackgroundColor", g_popupStyle.hoverBackgroundColor);
+            readColor("hoverTextColor", g_popupStyle.hoverTextColor);
+
+            if (g_popupStyle.popupWidth < 80) g_popupStyle.popupWidth = 80;
+            if (g_popupStyle.headerHeight < 20) g_popupStyle.headerHeight = 20;
+            if (g_popupStyle.rowHeight < 18) g_popupStyle.rowHeight = 18;
+            if (g_popupStyle.maxVisibleRows < 1) g_popupStyle.maxVisibleRows = 1;
+        }
+        catch (...) {
+            // Invalid config should never break the plugin. Defaults remain active.
+        }
+    }
+
+    static void EnsurePopupFonts()
+    {
+        if (g_cachedHeaderFont) return;
+        g_cachedHeaderFont = CreateFontA(
+            g_popupStyle.headerFontSize, 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            FIXED_PITCH | FF_MODERN, g_popupStyle.fontFace.c_str());
+        g_cachedRowFont = CreateFontA(
+            g_popupStyle.sectorFontSize, 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            FIXED_PITCH | FF_MODERN, g_popupStyle.fontFace.c_str());
+        g_cachedFreqFont = CreateFontA(
+            g_popupStyle.frequencyFontSize, 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            FIXED_PITCH | FF_MODERN, g_popupStyle.fontFace.c_str());
+    }
+
+    static EuroScopePlugIn::CFlightPlan FindFlightPlanByCallsign(const std::string& callsign)
+    {
+        for (EuroScopePlugIn::CFlightPlan fp = plugin.FlightPlanSelectFirst();
+            fp.IsValid();
+            fp = plugin.FlightPlanSelectNext(fp))
+        {
+            if (_stricmp(fp.GetCallsign(), callsign.c_str()) == 0)
+                return fp;
+        }
+
+        return EuroScopePlugIn::CFlightPlan();
+    }
+
+    static void HideCustomHandoffPopup()
+    {
+        if (g_handoffPopupWnd) {
+            ShowWindow(g_handoffPopupWnd, SW_HIDE);
+        }
+        g_handoffHoverIndex = -1;
+        g_handoffHoverSubIndex = -1;
+        g_selectedReleaseSubIndex = 0;
+    }
+
+    // Clicking a ReleaseBar mini-button only updates the selection.
+    // The annotation is written (and the handoff fired) when the user subsequently clicks a Sector row.
+    static void ExecuteReleaseBarButton(int subIndex)
+    {
+        if (subIndex < 0 || subIndex >= kReleaseBarCount) return;
+        g_selectedReleaseSubIndex = subIndex;
+        // Do NOT close the popup — the user still needs to pick a sector.
+    }
+
+    static void ExecuteCustomHandoffRow(const CustomHandoffRow& row)
+    {
+        EuroScopePlugIn::CFlightPlan fp = FindFlightPlanByCallsign(row.callsign);
+        if (!fp.IsValid())
+            return;
+
+        if (row.action == CustomHandoffAction::Assume) {
+            const int state = fp.GetState();
+            if (state == EuroScopePlugIn::FLIGHT_PLAN_STATE_TRANSFER_TO_ME_INITIATED)
+                fp.AcceptHandoff();
+            else
+                fp.StartTracking();
+            return;
+        }
+
+        if (row.action == CustomHandoffAction::Release) {
+            const char* trackingId = fp.GetTrackingControllerId();
+            std::string myPosId = plugin.ControllerMyself().GetPositionId();
+
+            if (trackingId && trackingId[0] &&
+                _stricmp(trackingId, myPosId.c_str()) == 0)
+            {
+                fp.EndTracking();
+            }
+            return;
+        }
+
+        if (row.action == CustomHandoffAction::Sector) {
+            if (!row.targetCallsign.empty()) {
+                // If a release type is selected via the ReleaseBar, write the annotation first.
+                if (g_selectedReleaseSubIndex >= 0 && g_selectedReleaseSubIndex < kReleaseBarCount) {
+                    fp.GetControllerAssignedData().SetFlightStripAnnotation(7, kReleaseBarCodes[g_selectedReleaseSubIndex]);
+                }
+
+                fp.InitiateHandoff(row.targetCallsign.c_str());
+
+                // Keep the existing Next Sector tag behavior: show the chosen sector
+                // while TRANSFER_FROM_ME_INITIATED.
+                std::string cs = fp.GetCallsign();
+                plugin.activeHandoffTargets[cs] = row.sectorId;
+
+                std::string key = cs + ":" + std::to_string(ItemCodes::TAG_ITEM_NEXT_SECTOR_CTRL);
+                plugin.renderCache.erase(key);
+            }
+            return;
+        }
+
+        // ReleaseBar clicks are routed through ExecuteReleaseBarButton with a sub-index;
+        // this path is not reached for ReleaseBar rows.
+    }
+
+
+    static bool CustomPopupHasAssumeRow()
+    {
+        for (size_t i = 0; i < g_handoffRows.size(); ++i) {
+            if (g_handoffRows[i].action == CustomHandoffAction::Assume ||
+                g_handoffRows[i].action == CustomHandoffAction::ReleaseBar)
+                return true;
+        }
+        return false;
+    }
+
+    static int GetEffectiveHeaderHeight()
+    {
+        // When ASSUME is not available, there is no Section 1 button.
+        // Compact the header so Section 2 starts directly below the title area.
+        return CustomPopupHasAssumeRow()
+            ? g_popupStyle.headerHeight
+            : 28;
+    }
+
+
+    static int GetCustomHandoffRowHeight(const CustomHandoffRow& row)
+    {
+        if (row.action == CustomHandoffAction::Separator)
+            return 8;
+
+        return g_popupStyle.rowHeight;
+    }
+
+    static int GetCustomHandoffRowsHeight(const std::vector<CustomHandoffRow>& rows, int maxVisibleRows)
+    {
+        int total = 0;
+
+        for (int i = 0; i < (int)rows.size() && i < maxVisibleRows; ++i) {
+            total += GetCustomHandoffRowHeight(rows[i]);
+        }
+
+        return total;
+    }
+
+    static int GetCustomHandoffRowTop(int rowIndex)
+    {
+        int y = 0;
+
+        for (int i = 0; i < rowIndex && i < (int)g_handoffRows.size(); ++i) {
+            y += GetCustomHandoffRowHeight(g_handoffRows[i]);
+        }
+
+        return y;
+    }
+
+    static int RowFromPointY(int y)
+    {
+        const int listTop = GetEffectiveHeaderHeight() + g_popupStyle.listVerticalPadding;
+
+        if (y < listTop)
+            return -1;
+
+        int curY = listTop;
+
+        for (int i = 0; i < (int)g_handoffRows.size() && i < g_popupStyle.maxVisibleRows; ++i) {
+            const int rowH = GetCustomHandoffRowHeight(g_handoffRows[i]);
+
+            if (y >= curY && y < curY + rowH) {
+                if (g_handoffRows[i].action == CustomHandoffAction::Separator)
+                    return -1;
+
+                return i;
+            }
+
+            curY += rowH;
+        }
+
+        return -1;
+    }
+
+    // Given a client-area X coordinate and the row rect width, return which mini-button
+    // (0-3) is under the cursor inside a ReleaseBar row, or -1 if outside.
+    static int ReleaseBarSubIndexFromX(int x, int clientWidth)
+    {
+        const int margin = g_popupStyle.popupBorder + 4;
+        const int barLeft = margin;
+        const int barRight = clientWidth - margin;
+        const int barWidth = barRight - barLeft;
+        if (barWidth <= 0 || x < barLeft || x >= barRight) return -1;
+
+        const int btnWidth = barWidth / kReleaseBarCount;
+        int sub = (x - barLeft) / btnWidth;
+        if (sub >= kReleaseBarCount) sub = kReleaseBarCount - 1;
+        return sub;
+    }
+
+    static void DrawCenteredText(HDC hdc, const std::string& text, RECT rc, COLORREF color, HFONT font)
+    {
+        HFONT oldFont = (HFONT)SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, color);
+        DrawTextA(hdc, text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, oldFont);
+    }
+
+    static LRESULT CALLBACK CustomHandoffPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        switch (msg) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_MOUSEMOVE:
+        {
+            KillTimer(hwnd, 1001);
+
+            TRACKMOUSEEVENT tme = {};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+
+            const int x = (short)LOWORD(lParam);
+            const int y = (short)HIWORD(lParam);
+            int idx = RowFromPointY(y);
+            if (idx >= 0 && g_handoffRows[idx].disabled)
+                idx = -1;
+
+            int subIdx = -1;
+            if (idx >= 0 && g_handoffRows[idx].action == CustomHandoffAction::ReleaseBar) {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                subIdx = ReleaseBarSubIndexFromX(x, rc.right);
+            }
+
+            if (idx != g_handoffHoverIndex || subIdx != g_handoffHoverSubIndex) {
+                g_handoffHoverIndex = idx;
+                g_handoffHoverSubIndex = subIdx;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            // Do not close immediately. Give the cursor a small safe zone around the popup.
+            SetTimer(hwnd, 1001, 200, NULL);
+            return 0;
+
+        case WM_TIMER:
+        {
+            if (wParam == 1001) {
+                POINT pt;
+                GetCursorPos(&pt);
+
+                RECT rc;
+                GetWindowRect(hwnd, &rc);
+
+                // Hover-safe margin around the popup. This prevents accidental closing
+                // when the mouse briefly leaves the exact window border.
+                InflateRect(&rc, 16, 16);
+
+                if (!PtInRect(&rc, pt)) {
+                    KillTimer(hwnd, 1001);
+                    HideCustomHandoffPopup();
+                }
+            }
+            else if (wParam == 1002) {
+                KillTimer(hwnd, 1002);
+                HideCustomHandoffPopup();
+            }
+            return 0;
+        }
+
+        case WM_KILLFOCUS:
+            KillTimer(hwnd, 1001);
+            KillTimer(hwnd, 1002);
+            HideCustomHandoffPopup();
+            return 0;
+
+        case WM_LBUTTONDOWN:
+        {
+            const int x = (short)LOWORD(lParam);
+            const int y = (short)HIWORD(lParam);
+            const int idx = RowFromPointY(y);
+
+            if (idx >= 0 && idx < (int)g_handoffRows.size() && !g_handoffRows[idx].disabled) {
+                const CustomHandoffRow& row = g_handoffRows[idx];
+
+                if (row.action == CustomHandoffAction::ReleaseBar) {
+                    RECT rc;
+                    GetClientRect(hwnd, &rc);
+                    const int sub = ReleaseBarSubIndexFromX(x, rc.right);
+                    if (sub < 0) return 0;  // clicked between buttons
+
+                    // Only update the selection; keep popup open so user can still pick a sector.
+                    ExecuteReleaseBarButton(sub);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    // Do NOT set the close timer.
+                }
+                else {
+                    CustomHandoffRow rowCopy = row;
+
+                    g_handoffHoverIndex = idx;
+                    g_handoffHoverSubIndex = -1;
+                    InvalidateRect(hwnd, NULL, FALSE);
+
+                    ExecuteCustomHandoffRow(rowCopy);
+
+                    KillTimer(hwnd, 1001);
+                    SetTimer(hwnd, 1002, 150, NULL);
+                }
+            }
+            return 0;
+        }
+
+        case WM_DESTROY:
+        case WM_NCDESTROY:
+            KillTimer(hwnd, 1001);
+            KillTimer(hwnd, 1002);
+            if (hwnd == g_handoffPopupWnd) {
+                g_handoffPopupWnd = NULL;
+            }
+            return 0;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+
+            RECT client = {};
+            GetClientRect(hwnd, &client);
+
+            // soft popup shadow
+            RECT shadow = client;
+            OffsetRect(&shadow, 3, 3);
+
+            HBRUSH shadowBrush = CreateSolidBrush(RGB(0, 0, 255));
+            FillRect(hdc, &shadow, shadowBrush);
+            DeleteObject(shadowBrush);
+
+            HBRUSH bg = CreateSolidBrush(g_popupStyle.backgroundColor);
+            FillRect(hdc, &client, bg);
+            DeleteObject(bg);
+
+            HPEN borderPen = CreatePen(PS_SOLID, 1, g_popupStyle.borderColor);
+            HGDIOBJ oldPen = SelectObject(hdc, borderPen);
+            HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+            // Draw the border inset by one pixel so it is visually even on all sides.
+            // Rectangle() treats right/bottom differently, so avoid using client.right/client.bottom directly.
+            RECT borderRect = client;
+            borderRect.left += 1;
+            borderRect.top += 1;
+            borderRect.right -= 1;
+            borderRect.bottom -= 1;
+
+            Rectangle(hdc, borderRect.left, borderRect.top, borderRect.right, borderRect.bottom);
+
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(borderPen);
+
+            EnsurePopupFonts();
+            HFONT headerFont = g_cachedHeaderFont;
+            HFONT rowFont    = g_cachedRowFont;
+            HFONT freqFont   = g_cachedFreqFont;
+
+            std::string callsign;
+            if (!g_handoffRows.empty())
+                callsign = g_handoffRows.front().callsign;
+
+            const int effectiveHeaderHeight = GetEffectiveHeaderHeight();
+
+            RECT r1{ 4, 5, client.right - 4, 24 };
+
+            DrawCenteredText(hdc, callsign, r1, g_popupStyle.headerTextColor, headerFont);
+
+            int currentRowY = effectiveHeaderHeight + g_popupStyle.listVerticalPadding;
+
+            for (int i = 0; i < (int)g_handoffRows.size() && i < g_popupStyle.maxVisibleRows; ++i) {
+                const CustomHandoffRow& row = g_handoffRows[i];
+                const int rowH = GetCustomHandoffRowHeight(row);
+
+                RECT rr{
+                    g_popupStyle.popupBorder + 4,
+                    currentRowY,
+                    client.right - g_popupStyle.popupBorder - 4,
+                    currentRowY + rowH
+                };
+
+                currentRowY += rowH;
+
+                if (row.action == CustomHandoffAction::Separator) {
+                    HPEN p = CreatePen(PS_SOLID, 1, g_popupStyle.separatorColor);
+                    HGDIOBJ op = SelectObject(hdc, p);
+                    const int midY = rr.top + (rowH / 2);
+                    MoveToEx(hdc, rr.left, midY, NULL);
+                    LineTo(hdc, rr.right, midY);
+                    SelectObject(hdc, op);
+                    DeleteObject(p);
+                    continue;
+                }
+
+                // ---- ReleaseBar: four small buttons side by side ----
+                if (row.action == CustomHandoffAction::ReleaseBar) {
+                    // Fill row background
+                    HBRUSH rowBg = CreateSolidBrush(g_popupStyle.backgroundColor);
+                    FillRect(hdc, &rr, rowBg);
+                    DeleteObject(rowBg);
+
+                    const int totalW = rr.right - rr.left;
+                    const int btnW = totalW / kReleaseBarCount;
+                    const int btnGap = 3;  // horizontal gap between mini-buttons
+
+                    // Active/selected button colour: use hover background with a visible border.
+                    const COLORREF selectedBg = g_popupStyle.hoverBackgroundColor;
+                    const COLORREF selectedTxt = g_popupStyle.hoverTextColor;
+
+                    for (int b = 0; b < kReleaseBarCount; ++b) {
+                        const bool isSelected = (b == g_selectedReleaseSubIndex);
+                        const bool btnHover = (i == g_handoffHoverIndex && b == g_handoffHoverSubIndex);
+
+                        COLORREF btnBg = isSelected ? selectedBg
+                            : btnHover ? RGB(200, 200, 200)  // lighter hover when not selected
+                            : g_popupStyle.buttonBackgroundColor;
+                        COLORREF txtCol = isSelected ? selectedTxt
+                            : g_popupStyle.normalTextColor;
+
+                        RECT btn;
+                        btn.left = rr.left + b * btnW + btnGap;
+                        btn.right = rr.left + (b + 1) * btnW - btnGap;
+                        btn.top = rr.top + 3;
+                        btn.bottom = rr.bottom - 3;
+
+                        HPEN   bPen = CreatePen(PS_SOLID, isSelected ? 2 : 1,
+                            isSelected ? RGB(40, 40, 40)
+                            : btnHover ? RGB(80, 80, 80)
+                            : RGB(120, 120, 120));
+                        HBRUSH bBrush = CreateSolidBrush(btnBg);
+
+                        HGDIOBJ oPen = SelectObject(hdc, bPen);
+                        HGDIOBJ oBrush = SelectObject(hdc, bBrush);
+
+                        RoundRect(hdc, btn.left, btn.top, btn.right, btn.bottom, 6, 6);
+
+                        SelectObject(hdc, oBrush);
+                        SelectObject(hdc, oPen);
+                        DeleteObject(bBrush);
+                        DeleteObject(bPen);
+
+                        DrawCenteredText(hdc, kReleaseBarLabels[b], btn, txtCol, rowFont);
+                    }
+                    continue;
+                }
+
+                const bool hover = (i == g_handoffHoverIndex);
+
+                // The full row uses the popup background. The inner rounded rectangle is the actual button.
+                COLORREF rowBgColor = g_popupStyle.backgroundColor;
+                COLORREF buttonBgColor = hover ? g_popupStyle.hoverBackgroundColor : g_popupStyle.buttonBackgroundColor;
+                COLORREF textColor = hover ? g_popupStyle.hoverTextColor : g_popupStyle.normalTextColor;
+
+                HBRUSH rowBg = CreateSolidBrush(rowBgColor);
+                FillRect(hdc, &rr, rowBg);
+                DeleteObject(rowBg);
+
+                // Draw each selectable entry as a rounded button.
+                // Separators are skipped earlier, so this applies to ASSUME, sector rows, and FREE.
+                RECT box = rr;
+                InflateRect(&box, -2, -1);
+
+                HPEN boxPen = CreatePen(PS_SOLID, 1, hover
+                    ? RGB(40, 40, 40)
+                    : RGB(120, 120, 120));
+
+                HBRUSH boxBrush = CreateSolidBrush(buttonBgColor);
+
+                HGDIOBJ oldBoxPen = SelectObject(hdc, boxPen);
+                HGDIOBJ oldBoxBrush = SelectObject(hdc, boxBrush);
+
+                RoundRect(
+                    hdc,
+                    box.left,
+                    box.top,
+                    box.right,
+                    box.bottom,
+                    8,
+                    8);
+
+                SelectObject(hdc, oldBoxBrush);
+                SelectObject(hdc, oldBoxPen);
+
+                DeleteObject(boxBrush);
+                DeleteObject(boxPen);
+
+                if (row.action == CustomHandoffAction::Sector && !row.frequency.empty()) {
+                    RECT sectorRect = rr;
+                    sectorRect.bottom = rr.top + (g_popupStyle.rowHeight / 2) + 3;
+
+                    RECT freqRect = rr;
+                    freqRect.top = rr.top + (g_popupStyle.rowHeight / 2) - 3;
+
+                    DrawCenteredText(hdc, row.label, sectorRect, textColor, rowFont);
+                    DrawCenteredText(hdc, row.frequency, freqRect, textColor, freqFont);
+                }
+                else {
+                    DrawCenteredText(hdc, row.label, rr, textColor, rowFont);
+                }
+            }
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        default:
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+        }
+    }
+
+    static void EnsureCustomHandoffPopupWindow()
+    {
+        LoadCustomHandoffPopupStyle();
+
+        if (g_handoffPopupWnd && IsWindow(g_handoffPopupWnd))
+            return;
+
+        HINSTANCE hInst = HINSTANCE(&__ImageBase);
+
+        static bool classRegistered = false;
+        if (!classRegistered) {
+            WNDCLASSEXA wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = CustomHandoffPopupProc;
+            wc.hInstance = hInst;
+            wc.lpszClassName = "LOAPluginCustomHandoffPopup";
+            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            wc.hbrBackground = NULL;
+            RegisterClassExA(&wc);
+            classRegistered = true;
+        }
+
+        g_handoffPopupWnd = CreateWindowExA(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            "LOAPluginCustomHandoffPopup",
+            "LOA Handoff",
+            WS_POPUP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            g_popupStyle.popupWidth,
+            200,
+            NULL,
+            NULL,
+            hInst,
+            NULL);
+    }
+
+    static void ShowCustomHandoffPopup(POINT pt, const std::vector<CustomHandoffRow>& rows)
+    {
+        POINT mousePt;
+        GetCursorPos(&mousePt);
+        pt = mousePt;
+
+        LoadCustomHandoffPopupStyle();
+
+        if (rows.empty())
+            return;
+
+        EnsureCustomHandoffPopupWindow();
+        if (!g_handoffPopupWnd)
+            return;
+
+        g_handoffRows = rows;
+        g_handoffHoverIndex = -1;
+        g_handoffHoverSubIndex = -1;
+        g_selectedReleaseSubIndex = 0;  // default: F (Full) pre-selected
+
+        const int visibleRows = (int)std::min<size_t>(g_handoffRows.size(), g_popupStyle.maxVisibleRows);
+        // Use a smaller bottom padding so the visual gap above/below the list appears equal.
+        const int bottomPadding = 1;
+        const int effectiveHeaderHeight = GetEffectiveHeaderHeight();
+        const int rowsHeight = GetCustomHandoffRowsHeight(g_handoffRows, g_popupStyle.maxVisibleRows);
+
+        const int height =
+            effectiveHeaderHeight +
+            g_popupStyle.listVerticalPadding +
+            bottomPadding +
+            rowsHeight +
+            (g_popupStyle.popupBorder * 2);
+
+        // Anchor row: the row that will be centred under the mouse cursor when the popup opens.
+        // In ASSUMED state the user most likely wants to hand off immediately, so anchor to the
+        // first sector row — it can be clicked without moving the mouse.
+        // In all other states prefer ASSUME/ReleaseBar so the most common action is under the cursor.
+        int anchorRow = 0;
+        bool foundAnchor = false;
+
+        const bool preferSectorAnchor =
+            !g_handoffRows.empty() &&
+            g_handoffRows.front().action == CustomHandoffAction::ReleaseBar &&
+            // Only true when we're in ASSUMED (ReleaseBar present but no ASSUME row after it)
+            [&]() {
+            for (const auto& r : g_handoffRows)
+                if (r.action == CustomHandoffAction::Assume) return false;
+            return true;
+            }();
+
+        if (preferSectorAnchor) {
+            // ASSUMED state: anchor to first sector row.
+            for (int i = 0; i < (int)g_handoffRows.size(); ++i) {
+                if (g_handoffRows[i].action == CustomHandoffAction::Sector && !g_handoffRows[i].disabled) {
+                    anchorRow = i;
+                    foundAnchor = true;
+                    break;
+                }
+            }
+        }
+
+        // For all other states (or if no sector found above): prefer ASSUME or ReleaseBar.
+        if (!foundAnchor) {
+            for (int i = 0; i < (int)g_handoffRows.size(); ++i) {
+                if ((g_handoffRows[i].action == CustomHandoffAction::Assume ||
+                    g_handoffRows[i].action == CustomHandoffAction::ReleaseBar) &&
+                    !g_handoffRows[i].disabled) {
+                    anchorRow = i;
+                    foundAnchor = true;
+                    break;
+                }
+            }
+        }
+
+        // Otherwise use first sector.
+        if (!foundAnchor) {
+            for (int i = 0; i < (int)g_handoffRows.size(); ++i) {
+                if (g_handoffRows[i].action == CustomHandoffAction::Sector && !g_handoffRows[i].disabled) {
+                    anchorRow = i;
+                    foundAnchor = true;
+                    break;
+                }
+            }
+        }
+
+        // Otherwise use FREE.
+        if (!foundAnchor) {
+            for (int i = 0; i < (int)g_handoffRows.size(); ++i) {
+                if (g_handoffRows[i].action == CustomHandoffAction::Release && !g_handoffRows[i].disabled) {
+                    anchorRow = i;
+                    foundAnchor = true;
+                    break;
+                }
+            }
+        }
+
+        int x = pt.x - (g_popupStyle.popupWidth / 2);
+        int y = pt.y - effectiveHeaderHeight - g_popupStyle.listVerticalPadding - GetCustomHandoffRowTop(anchorRow) - (GetCustomHandoffRowHeight(g_handoffRows[anchorRow]) / 2);
+
+        // Keep the popup on the current monitor.
+        HWND esWnd = GetForegroundWindow();
+        HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoA(mon, &mi)) {
+            if (x < mi.rcWork.left) x = mi.rcWork.left;
+            if (y < mi.rcWork.top) y = mi.rcWork.top;
+            if (x + g_popupStyle.popupWidth > mi.rcWork.right) x = mi.rcWork.right - g_popupStyle.popupWidth;
+            if (y + height > mi.rcWork.bottom) y = mi.rcWork.bottom - height;
+        }
+
+        // Make the visual highlight match the row centered under the mouse.
+        // Prefer first sector when available; otherwise ASSUME/ReleaseBar/FREE from the anchor logic above.
+        g_handoffHoverIndex = anchorRow;
+        g_handoffHoverSubIndex = -1;  // no sub-button pre-highlighted
+
+        SetWindowPos(
+            g_handoffPopupWnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            g_popupStyle.popupWidth,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+        InvalidateRect(g_handoffPopupWnd, NULL, TRUE);
+        UpdateWindow(g_handoffPopupWnd);
+    }
+}
+
 
 std::vector<LOAEntry> destinationLoas;
 std::vector<LOAEntry> departureLoas;
@@ -149,7 +1048,9 @@ void LOAPlugin::OnControllerPositionUpdate(EuroScopePlugIn::CController controll
     }
 }
 
-LOAPlugin::~LOAPlugin() {}
+LOAPlugin::~LOAPlugin() {
+    DestroyCustomHandoffPopup();
+}
 
 
 void LOAPlugin::LoadSectorOwnership()
@@ -191,6 +1092,84 @@ void LOAPlugin::LoadSectorOwnership()
     }
 
     DisplayUserMessage("LOA Plugin", "Sector Ownership", "sector_ownership.json loaded successfully", true, true, false, false, false);
+}
+
+
+static std::string TrimVolumeCoordText(std::string s)
+{
+    const char* ws = " \t\r\n";
+    const size_t start = s.find_first_not_of(ws);
+    if (start == std::string::npos) return std::string();
+    const size_t end = s.find_last_not_of(ws);
+    s = s.substr(start, end - start + 1);
+
+    // Allow common copied coordinate decorations, e.g. N540230 / E0092429.
+    if (!s.empty() && (s[0] == 'N' || s[0] == 'n' || s[0] == 'E' || s[0] == 'e' ||
+        s[0] == 'S' || s[0] == 's' || s[0] == 'W' || s[0] == 'w')) {
+        s = s.substr(1);
+    }
+    return s;
+}
+
+static bool TryParseCompactDmsCoordinate(std::string text, bool isLongitude, double& outDecimal)
+{
+    // Supported volumes.json coordinate formats:
+    //   latitude:  "DDMMSS"  e.g. "540230"  -> 54°02'30"
+    //   longitude: "DDDMMSS" e.g. "0092429" -> 009°24'29"
+    // Optional leading +/- is accepted. Optional N/E/S/W prefix is accepted.
+    text = TrimVolumeCoordText(text);
+    if (text.empty()) return false;
+
+    double sign = 1.0;
+    if (text[0] == '+' || text[0] == '-') {
+        sign = (text[0] == '-') ? -1.0 : 1.0;
+        text = text.substr(1);
+    }
+
+    const size_t expectedDigits = isLongitude ? 7u : 6u;
+    if (text.size() != expectedDigits) return false;
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (!std::isdigit((unsigned char)text[i])) return false;
+    }
+
+    const size_t degDigits = isLongitude ? 3u : 2u;
+    const int deg = std::atoi(text.substr(0, degDigits).c_str());
+    const int min = std::atoi(text.substr(degDigits, 2).c_str());
+    const int sec = std::atoi(text.substr(degDigits + 2, 2).c_str());
+
+    if (min > 59 || sec > 59) return false;
+    if (isLongitude) {
+        if (deg > 180) return false;
+    }
+    else {
+        if (deg > 90) return false;
+    }
+
+    outDecimal = sign * ((double)deg + ((double)min / 60.0) + ((double)sec / 3600.0));
+    return true;
+}
+
+static bool TryReadVolumePointLL(const json& pt, double& outLat, double& outLon)
+{
+    if (!pt.is_array() || pt.size() < 2) return false;
+
+    // Old decimal-degree format: [54.041944, 9.408333]
+    if (pt[0].is_number() && pt[1].is_number()) {
+        outLat = pt[0].get<double>();
+        outLon = pt[1].get<double>();
+        return true;
+    }
+
+    // New compact copy/paste format: ["DDMMSS", "DDDMMSS"]
+    if (pt[0].is_string() && pt[1].is_string()) {
+        const std::string latText = pt[0].get<std::string>();
+        const std::string lonText = pt[1].get<std::string>();
+        return TryParseCompactDmsCoordinate(latText, false, outLat) &&
+            TryParseCompactDmsCoordinate(lonText, true, outLon);
+    }
+
+    return false;
 }
 // Load custom volumes from a separate JSON file (optional).
 // Path is usually: <plugin folder>\loa_configs_json\volumes.json
@@ -255,12 +1234,26 @@ void LOAPlugin::LoadVolumesFromJSON(const std::string& volumesPath)
         }
 
         cv.polygon.clear();
+        int skippedPoints = 0;
         if (v.contains("polygon") && v["polygon"].is_array()) {
             for (const auto& pt : v["polygon"]) {
-                if (!pt.is_array() || pt.size() < 2) continue;
-                if (!pt[0].is_number() || !pt[1].is_number()) continue;
-                cv.polygon.push_back(std::make_pair(pt[0].get<double>(), pt[1].get<double>()));
+                double lat = 0.0;
+                double lon = 0.0;
+                if (TryReadVolumePointLL(pt, lat, lon)) {
+                    // Store internally as decimal degrees. The predicted route logic already uses
+                    // decimal lat/lon, so no changes are needed in the matcher.
+                    cv.polygon.push_back(std::make_pair(lat, lon));
+                }
+                else {
+                    ++skippedPoints;
+                }
             }
+        }
+
+        if (skippedPoints > 0) {
+            char warn[256];
+            sprintf_s(warn, sizeof(warn), "Volume %s skipped %d invalid coordinate point(s)", cv.id.c_str(), skippedPoints);
+            DisplayUserMessage("LOA Plugin", "Volumes", warn, true, true, false, false, false);
         }
 
         if (cv.polygon.size() >= 3) {
@@ -325,6 +1318,7 @@ void LOAPlugin::LoadLOAsFromJSON() {
 
     destinationFallbackLoas.clear();
     departureFallbackLoas.clear();
+    validLoaEntryPtrs.clear();
 
     aorDestinationSet.clear();
     aorDestinationPrefixes.clear();
@@ -453,12 +1447,6 @@ void LOAPlugin::LoadLOAsFromJSON() {
                 loa.predictedFromVolumes = item["predictedFromVolumes"].get<std::vector<std::string>>();
             if (item.contains("predictedToVolumes"))
                 loa.predictedToVolumes = item["predictedToVolumes"].get<std::vector<std::string>>();
-            if (item.contains("predictedEndVolumes"))
-                loa.predictedEndVolumes = item["predictedEndVolumes"].get<std::vector<std::string>>();
-            else if (item.contains("predictedEndsInVolumes"))
-                loa.predictedEndVolumes = item["predictedEndsInVolumes"].get<std::vector<std::string>>();
-            else if (item.contains("predictedEndVolume"))
-                loa.predictedEndVolumes = item["predictedEndVolume"].get<std::vector<std::string>>();
 
             if (item.contains("nextSectors"))
                 loa.nextSectors = item["nextSectors"].get<std::vector<std::string>>();
@@ -566,6 +1554,13 @@ void LOAPlugin::LoadLOAsFromJSON() {
 
     indexEntries(destinationLoas);
     indexEntries(departureLoas);
+
+    // Rebuild O(1) pointer-validity set now that all entry vectors are final
+    validLoaEntryPtrs.clear();
+    for (const auto& e : destinationLoas)         validLoaEntryPtrs.insert(&e);
+    for (const auto& e : departureLoas)           validLoaEntryPtrs.insert(&e);
+    for (const auto& e : destinationFallbackLoas) validLoaEntryPtrs.insert(&e);
+    for (const auto& e : departureFallbackLoas)   validLoaEntryPtrs.insert(&e);
 
     currentFrameOnlineControllers = GetOnlineControllersCached();
     if (GetTickCount64() >= coldStartUntil) {
@@ -1049,9 +2044,10 @@ const std::vector<std::string>& LOAPlugin::GetCachedRoutePoints(const EuroScopeP
     std::string callsign = fp.GetCallsign();
     ULONGLONG now = GetTickCount64();
 
-    // 10s cache validity
-    if (routeCache.count(callsign) && now - routeCacheTime[callsign] < 5000) {
-        return routeCache[callsign];
+    auto itTime = routeCacheTime.find(callsign);
+    if (itTime != routeCacheTime.end() && now - itTime->second < 5000) {
+        auto itPts = routeCache.find(callsign);
+        if (itPts != routeCache.end()) return itPts->second;
     }
 
     auto route = fp.GetExtractedRoute();
@@ -1059,19 +2055,76 @@ const std::vector<std::string>& LOAPlugin::GetCachedRoutePoints(const EuroScopeP
     for (int i = 0; i < route.GetPointsNumber(); ++i)
         routePoints.emplace_back(route.GetPointName(i));
 
-    routeCache[callsign] = std::move(routePoints);
     routeCacheTime[callsign] = now;
+    auto& resultPts = routeCache[callsign];
+    resultPts = std::move(routePoints);
+    return resultPts;
+}
 
-    return routeCache[callsign];
+bool LOAPlugin::IsLoaEntryPointerValid(const LOAEntry* entry) const
+{
+    return entry && validLoaEntryPtrs.count(entry) > 0;
 }
 
 void LOAPlugin::CleanupCache(const std::string& callsign) {
     matchedLOACache.erase(callsign);
     routeCache.erase(callsign);
     routeCacheTime.erase(callsign);
+    routeSetCache.erase(callsign);
+    routeSetCacheTime.erase(callsign);
     coordinationStates.erase(callsign);
     matchTimestamps.erase(callsign);
     matchVersions.erase(callsign);
+    lastDestinationByCallsign.erase(callsign);
+
+    if (_stricmp(currentFrameCallsign.c_str(), callsign.c_str()) == 0) {
+        currentFrameMatchedEntry = nullptr;
+        currentFrameCallsign.clear();
+        currentFrameRoutePoints.clear();
+        currentFrameRouteSet.clear();
+        currentFrameTimestamp = 0;
+    }
+}
+
+void LOAPlugin::PrunePerformanceCaches(ULONGLONG nowMs)
+{
+    // Keep long sessions stable even if many callsigns come and go.
+    // These caches are only accelerators; clearing old entries does not remove plugin features.
+    const ULONGLONG routeTtlMs = 60000ULL;
+    const ULONGLONG matchTtlMs = 60000ULL;
+
+    for (auto it = routeCacheTime.begin(); it != routeCacheTime.end(); ) {
+        if (nowMs - it->second > routeTtlMs) {
+            const std::string cs = it->first;
+            it = routeCacheTime.erase(it);
+            routeCache.erase(cs);
+            routeSetCache.erase(cs);
+            routeSetCacheTime.erase(cs);
+            routeSignature.erase(cs);
+            lastDestinationByCallsign.erase(cs);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    for (auto it = matchTimestamps.begin(); it != matchTimestamps.end(); ) {
+        if (nowMs - it->second > matchTtlMs) {
+            const std::string cs = it->first;
+            it = matchTimestamps.erase(it);
+            matchedLOACache.erase(cs);
+            matchVersions.erase(cs);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    // Render cache keys are callsign:itemCode. If it grows unexpectedly, clear it;
+    // the next render will rebuild values immediately.
+    if (renderCache.size() > 2000) {
+        renderCache.clear();
+    }
 }
 
 void LOAPlugin::OnFlightPlanStateChange(EuroScopePlugIn::CFlightPlan fp) {
@@ -1185,19 +2238,23 @@ void LOAPlugin::CheckForOwnershipChange() {
     std::string mySector = ControllerMyself().GetPositionId();
     if (mySector.empty()) return;
 
-    auto oldControllers = currentFrameOnlineControllers;
-    currentFrameOnlineControllers = GetOnlineControllersCached();
-
-    bool changed = false;
     std::vector<std::string> checkSectors;
     auto ownIt = sectorOwnership.find(mySector);
     if (ownIt != sectorOwnership.end()) checkSectors = ownIt->second;
-    checkSectors.push_back(mySector);  // Include your own sector
+    checkSectors.push_back(mySector);
 
-    for (const auto& s : checkSectors) {
-        std::string newCtrl = ResolveControllingSector(s, currentFrameOnlineControllers);
-        std::string oldCtrl = ResolveControllingSector(s, oldControllers);
-        if (_stricmp(newCtrl.c_str(), oldCtrl.c_str()) != 0) {
+    // Snapshot only the per-sector resolved strings (avoids copying the full online set)
+    std::vector<std::string> oldResolved;
+    oldResolved.reserve(checkSectors.size());
+    for (const auto& s : checkSectors)
+        oldResolved.push_back(ResolveControllingSector(s, currentFrameOnlineControllers));
+
+    currentFrameOnlineControllers = GetOnlineControllersCached();
+
+    bool changed = false;
+    for (size_t i = 0; i < checkSectors.size(); ++i) {
+        const std::string newCtrl = ResolveControllingSector(checkSectors[i], currentFrameOnlineControllers);
+        if (_stricmp(newCtrl.c_str(), oldResolved[i].c_str()) != 0) {
             changed = true;
             break;
         }
@@ -1217,14 +2274,18 @@ void LOAPlugin::CheckForOwnershipChange() {
 
         LoadLOAsFromJSON();
 
-        // Force tag redraw immediately
-        EuroScopePlugIn::CFlightPlan plan = FlightPlanSelectFirst();
-        while (plan.IsValid()) {
-            plugin.CleanupCache(plan.GetCallsign());
-            plan = FlightPlanSelectNext(plan);
-        }
+        // Bulk-clear the caches not already cleared above (replaces per-aircraft CleanupCache loop)
+        routeSetCache.clear();
+        routeSetCacheTime.clear();
+        lastDestinationByCallsign.clear();
+        currentFrameMatchedEntry = nullptr;
+        currentFrameCallsign.clear();
+        currentFrameRoutePoints.clear();
+        currentFrameRouteSet.clear();
+        currentFrameTimestamp = 0;
+        currentFrameRenderData = PerAircraftFrameData{};
 
-        reloading = false; // ✅ end reload guard safely
+        reloading = false;
     }
 }
 
@@ -1257,9 +2318,10 @@ void LOAPlugin::OnFunctionCall(
             const auto& online = GetOnlineControllersCached();
 
             struct Option {
-                std::string sectorId;  // controlling / predicted sector ID (e.g. "ALR", "HAM", "EDWW_CTR")
-                std::string freqStr;   // "123.450"
-                bool isLoa = false;    // true = LOA seeded, false = EuroScope predicted
+                std::string sectorId;       // displayed sector ID
+                std::string targetCallsign; // actual controller callsign used by InitiateHandoff()
+                std::string freqStr;        // "123.450"
+                bool isLoa = false;         // true = LOA seeded, false = EuroScope predicted
             };
 
             std::vector<Option> options;  // unified list (LOA + ES hybrid)
@@ -1297,31 +2359,24 @@ void LOAPlugin::OnFunctionCall(
                 size_t loaCount = 0;
                 std::vector<std::string> hybridList = BuildHybridPredictedSectorList(fp, online, &loaCount);
 
+                // Single pass over all controllers to build posId -> (callsign, freq) map
+                std::unordered_map<std::string, std::pair<std::string, std::string>> controllerInfoByPosId;
+                for (EuroScopePlugIn::CController c = ControllerSelectFirst(); c.IsValid(); c = ControllerSelectNext(c)) {
+                    if (!c.IsController()) continue;
+                    char fbuf[16] = {};
+                    _snprintf_s(fbuf, sizeof(fbuf), _TRUNCATE, "%.3f", c.GetPrimaryFrequency());
+                    controllerInfoByPosId[c.GetPositionId()] = { c.GetCallsign(), std::string(fbuf) };
+                }
+
                 for (size_t i = 0; i < hybridList.size(); ++i) {
                     const auto& cid = hybridList[i];
                     const bool isLoaSeeded = (i < loaCount);
-                    // Only show sectors that are actually online
                     if (online.count(cid) == 0)
                         continue;
 
-                    // Find the controller object for this position ID and read its frequency
-                    for (EuroScopePlugIn::CController c = ControllerSelectFirst();
-                        c.IsValid();
-                        c = ControllerSelectNext(c))
-                    {
-                        if (!c.IsController()) continue;
-                        if (_stricmp(c.GetPositionId(), cid.c_str()) != 0)
-                            continue;
-
-                        double freq = c.GetPrimaryFrequency();
-                        char buf[16] = {};
-                        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f", freq);
-
-                        // Keep it compact: frequency string has no leading padding.
-                        std::string freqStr = buf;
-
-                        options.push_back({ cid, freqStr, isLoaSeeded });
-                        break;
+                    auto ctIt = controllerInfoByPosId.find(cid);
+                    if (ctIt != controllerInfoByPosId.end()) {
+                        options.push_back({ cid, ctIt->second.first, ctIt->second.second, isLoaSeeded });
                     }
                 }
             }
@@ -1333,119 +2388,105 @@ void LOAPlugin::OnFunctionCall(
                 return;
             }
 
-            char title[64] = {};
-            _snprintf_s(title, sizeof(title), _TRUNCATE, "%s - Handoff", fp.GetCallsign());
+            // ----------------- 3) Build custom TopSky-style popup rows -----------------
+            // Structure:
+            //   Section 1: Callsign + Transfer Menu header
+            //              + ASSUME  (when not yet tracking)
+            //              + ReleaseBar F/T/C/D  (when ASSUMED or TRANSFER_FROM_ME_INITIATED)
+            //   Separator
+            //   Section 2: Sector ID buttons
+            std::vector<CustomHandoffRow> rows;
+            const std::string callsign = fp.GetCallsign();
 
-            // 1-column popup: we draw "ID FREQ" ourselves per line
-            OpenPopupList(Area, title, 1);
+            // Show ReleaseBar (F T C D) when I own the track, ASSUME otherwise.
+            const bool showReleaseBar =
+                state == EuroScopePlugIn::FLIGHT_PLAN_STATE_ASSUMED ||
+                state == EuroScopePlugIn::FLIGHT_PLAN_STATE_TRANSFER_FROM_ME_INITIATED;
 
-            // ----------------- 3) Prepare lines (fixed minimum width) -----------------
-            std::vector<std::string> optionLines;
-            optionLines.reserve(options.size());
+            if (showReleaseBar) {
+                CustomHandoffRow r;
+                r.action = CustomHandoffAction::ReleaseBar;
+                r.callsign = callsign;
+                rows.push_back(r);
+            }
 
-            size_t maxWidth = 0;
+            // In TRANSFER_FROM_ME_INITIATED also show ASSUME so the controller
+            // can take the tag back if they handed off to the wrong sector.
+            const bool showAssume =
+                canShowAssume ||
+                state == EuroScopePlugIn::FLIGHT_PLAN_STATE_TRANSFER_FROM_ME_INITIATED;
+
+            if (!showReleaseBar && showAssume) {
+                CustomHandoffRow r;
+                r.action = CustomHandoffAction::Assume;
+                r.label = "ASSUME";
+                r.callsign = callsign;
+                rows.push_back(r);
+            }
+            else if (showReleaseBar && state == EuroScopePlugIn::FLIGHT_PLAN_STATE_TRANSFER_FROM_ME_INITIATED) {
+                // Separator between ReleaseBar and ASSUME
+                CustomHandoffRow sep;
+                sep.action = CustomHandoffAction::Separator;
+                sep.callsign = callsign;
+                sep.disabled = true;
+                rows.push_back(sep);
+
+                CustomHandoffRow r;
+                r.action = CustomHandoffAction::Assume;
+                r.label = "ASSUME";
+                r.callsign = callsign;
+                rows.push_back(r);
+            }
+
+            if (!options.empty()) {
+                // Divider between Section 1 and Section 2
+                CustomHandoffRow sep;
+                sep.action = CustomHandoffAction::Separator;
+                sep.callsign = callsign;
+                sep.disabled = true;
+                rows.push_back(sep);
+            }
+
+            // Display only the next 5 sector options.
+            const size_t maxSectorRows = 5;
+            size_t sectorRowsAdded = 0;
+
             for (const auto& opt : options) {
-                std::string line;
-                line.reserve(opt.sectorId.size() + 2 + opt.freqStr.size());
-                line += (opt.isLoa ? "*" : "-");
-                line += opt.sectorId;
-                if (!opt.freqStr.empty()) {
-                    line += " ";
-                    line += opt.freqStr;
-                }
-                optionLines.push_back(line);
-                if (line.size() > maxWidth) maxWidth = line.size();
+                if (sectorRowsAdded >= maxSectorRows)
+                    break;
+
+                CustomHandoffRow r;
+                r.action = CustomHandoffAction::Sector;
+                r.sectorId = opt.sectorId;
+                r.targetCallsign = opt.targetCallsign;
+                r.callsign = callsign;
+                r.frequency = opt.freqStr;
+
+                // Display LOA-matched sectors with a leading asterisk.
+                r.label = opt.isLoa
+                    ? ("*" + opt.sectorId + "*")
+                    : opt.sectorId;
+
+                rows.push_back(r);
+                ++sectorRowsAdded;
             }
 
-            // Force a constant popup width even if current entries are shorter.
-            // Longest possible line is e.g. "ZZZZ 118.205" (+ our LOA/ES marker prefix).
-            // This keeps the handoff list width stable across different next-sector sets.
-            const size_t kMinPopupWidth = std::string("*ZZZZ 118.205").size();
-            if (maxWidth < kMinPopupWidth)
-                maxWidth = kMinPopupWidth;
-
-            // Account for action labels too
-            if (std::string("ASSUME").size() > maxWidth)
-                maxWidth = std::string("ASSUME").size();
-
-            if (std::string("FREE").size() > maxWidth)
-                maxWidth = std::string("FREE").size();
-
-            auto padRight = [&](const std::string& text) -> std::string {
-                if (text.size() >= maxWidth) return text;
-                return text + std::string(maxWidth - text.size(), ' ');
-                };
-
-            auto centerText = [&](const std::string& text) -> std::string {
-                if (text.size() >= maxWidth) return text;
-                const size_t leftPad = (maxWidth - text.size()) / 2;
-                const size_t rightPad = (maxWidth - text.size()) - leftPad;
-                return std::string(leftPad, ' ') + text + std::string(rightPad, ' ');
-                };
-
-            const std::string separator(maxWidth, '-');
-
-            // ----------------- 4) ASSUME (TOP) -----------------
-            if (canShowAssume) {
-                const std::string assumeLine = AddArrowPrefix(centerText("ASSUME"));
-                AddPopupListElement(
-                    assumeLine.c_str(),
-                    "",
-                    FunctionIds::NEXT_SECTOR_ASSUME_EXEC,
-                    false,
-                    POPUP_ELEMENT_NO_CHECKBOX,
-                    false,
-                    false);
-
-                // Visual divider under Assume
-                AddPopupListElement(
-                    separator.c_str(),
-                    "",
-                    0,
-                    false,
-                    POPUP_ELEMENT_NO_CHECKBOX,
-                    true,
-                    false);
-            }
-
-            // ----------------- 5) Hybrid next-sector options -------------
-            for (const auto& lineRaw : optionLines) {
-                const std::string line = AddArrowPrefix(padRight(lineRaw));
-                AddPopupListElement(
-                    line.c_str(),
-                    "",
-                    FunctionIds::NEXT_SECTOR_HANDOFF_EXEC,
-                    false,
-                    POPUP_ELEMENT_NO_CHECKBOX,
-                    false,
-                    false);
-            }
-
-            // ----------------- 6) RELEASE (BOTTOM) ----------------
             if (canShowRelease) {
-                // Divider above Release (only if we had anything above it)
-                if (canShowAssume || !optionLines.empty()) {
-                    AddPopupListElement(
-                        separator.c_str(),
-                        "",
-                        0,
-                        false,
-                        POPUP_ELEMENT_NO_CHECKBOX,
-                        true,
-                        false);
-                }
+                // Divider above FREE
+                CustomHandoffRow sep;
+                sep.action = CustomHandoffAction::Separator;
+                sep.callsign = callsign;
+                sep.disabled = true;
+                rows.push_back(sep);
 
-                const std::string releaseLine = AddArrowPrefix(centerText("FREE"));
-                AddPopupListElement(
-                    releaseLine.c_str(),
-                    "",
-                    FunctionIds::NEXT_SECTOR_RELEASE_EXEC,
-                    false,
-                    POPUP_ELEMENT_NO_CHECKBOX,
-                    false,
-                    false);
+                CustomHandoffRow r;
+                r.action = CustomHandoffAction::Release;
+                r.label = "FREE";
+                r.callsign = callsign;
+                rows.push_back(r);
             }
 
+            ShowCustomHandoffPopup(Pt, rows);
             return;
         }
 
@@ -1514,8 +2555,9 @@ void LOAPlugin::OnFunctionCall(
             while (!line.empty() && (line[0] == ' ' || line[0] == '\t' || line[0] == '\r' || line[0] == '\n'))
                 line.erase(line.begin());
 
-            // Strip LOA/ES marker prefix if present ('*' for LOA, '-' for predicted)
-            if (!line.empty() && (line[0] == '*' || line[0] == '-')) {
+            // Strip LOA marker prefix if present ('*' for LOA).
+            // Predicted sectors use a leading space only; that was already trimmed above.
+            if (!line.empty() && line[0] == '*') {
                 line.erase(line.begin());
                 while (!line.empty() && (line[0] == ' ' || line[0] == '\t'))
                     line.erase(line.begin());
@@ -1573,16 +2615,18 @@ void LOAPlugin::OnGetTagItem(
     double* pFontSize)
 {
     const std::string callsign = flightPlan.GetCallsign();
-    const auto& fpd = flightPlan.GetFlightPlanData();
     int clearedAltitude = flightPlan.GetClearedAltitude();
     int finalAltitude = flightPlan.GetFinalAltitude();
-    std::string origin = fpd.GetOrigin();
-    std::string destination = fpd.GetDestination();
-
-    plugin.lastTagData = { callsign, clearedAltitude, finalAltitude, origin, destination };
 
     // ---------- MICRO-CACHE: reuse last render for this callsign+itemCode (<= 750–1000 ms) ----------
     ULONGLONG now = GetTickCount64();
+
+    static ULONGLONG lastCachePruneMs = 0;
+    if (now - lastCachePruneMs > 30000ULL) {
+        plugin.PrunePerformanceCaches(now);
+        lastCachePruneMs = now;
+    }
+
     const int sectorControlVersion = plugin.sectorControlVersion;
     const std::string coordPt = flightPlan.GetExitCoordinationPointName();
     const int coordPtSt = flightPlan.GetExitCoordinationNameState();
@@ -1625,24 +2669,33 @@ void LOAPlugin::OnGetTagItem(
         plugin.currentFrameCallsign = callsign;
         plugin.currentFrameTimestamp = now;
         plugin.currentFrameOnlineControllers = plugin.GetOnlineControllersCached();
+
+        // Poll once per current-frame refresh instead of inside every matcher call.
+        // The poll remains throttled internally, but keeping it here avoids sector-file scans
+        // from being triggered by secondary tag render paths.
+        plugin.PollActiveRunwaysIfNeeded();
+
         plugin.currentFrameRoutePoints = plugin.GetCachedRoutePoints(flightPlan);
 
         // Detect FP edits (origin/dest/route) and invalidate per-callsign caches immediately.
         {
-            static std::unordered_map<std::string, std::string> lastDestinationByCallsign;
+            const auto& fpd = flightPlan.GetFlightPlanData();
+            plugin.currentFrameRenderData.origin      = fpd.GetOrigin();
+            plugin.currentFrameRenderData.destination = fpd.GetDestination();
+
             auto itDest = lastDestinationByCallsign.find(callsign);
             const bool destinationChanged = (itDest != lastDestinationByCallsign.end() &&
-                _stricmp(itDest->second.c_str(), destination.c_str()) != 0);
-            lastDestinationByCallsign[callsign] = destination;
+                _stricmp(itDest->second.c_str(), plugin.currentFrameRenderData.destination.c_str()) != 0);
+            lastDestinationByCallsign[callsign] = plugin.currentFrameRenderData.destination;
 
             // Incremental FNV-1a hash (avoid building a large concatenated string)
             unsigned long long h = 1469598103934665603ULL;
             auto fnv_feed = [&](const std::string& s) {
                 for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
                 };
-            fnv_feed(origin);
+            fnv_feed(plugin.currentFrameRenderData.origin);
             fnv_feed("|");
-            fnv_feed(destination);
+            fnv_feed(plugin.currentFrameRenderData.destination);
             fnv_feed("|");
             for (const auto& rp : plugin.currentFrameRoutePoints) {
                 fnv_feed(rp);
@@ -1662,21 +2715,29 @@ void LOAPlugin::OnGetTagItem(
 
         plugin.currentFrameRouteSet = plugin.GetCachedRouteSet(flightPlan);
         plugin.currentFrameMatchedEntry = MatchLoaEntry(flightPlan, plugin.currentFrameOnlineControllers);
+        if (plugin.currentFrameMatchedEntry && !plugin.IsLoaEntryPointerValid(plugin.currentFrameMatchedEntry)) {
+            plugin.currentFrameMatchedEntry = nullptr;
+        }
     }
+
+    plugin.currentFrameRenderData.callsign        = callsign;
+    plugin.currentFrameRenderData.clearedAltitude = clearedAltitude;
+    plugin.currentFrameRenderData.finalAltitude   = finalAltitude;
+    plugin.currentFrameRenderData.matchedEntry    = plugin.currentFrameMatchedEntry;
 
     // ---- Render selected tag item
     switch (itemCode)
     {
     case 1996:
-        RenderXFLTagItem(flightPlan, radarTarget, tagData, sItemString, pColorCode, pRGB, pFontSize);
+        RenderXFLTagItem(flightPlan, radarTarget, tagData, sItemString, pColorCode, pRGB, pFontSize, plugin.currentFrameRenderData);
         break;
 
     case 2000:
-        RenderXFLDetailedTagItem(flightPlan, radarTarget, tagData, sItemString, pColorCode, pRGB, pFontSize);
+        RenderXFLDetailedTagItem(flightPlan, radarTarget, tagData, sItemString, pColorCode, pRGB, pFontSize, plugin.currentFrameRenderData);
         break;
 
     case 1997:
-        RenderCOPTagItem(flightPlan, radarTarget, tagData, sItemString, pColorCode, pRGB, pFontSize);
+        RenderCOPTagItem(flightPlan, radarTarget, tagData, sItemString, pColorCode, pRGB, pFontSize, plugin.currentFrameRenderData);
         break;
 
     case 2001:
@@ -1814,13 +2875,10 @@ const std::unordered_set<std::string>& LOAPlugin::GetCachedRouteSet(const EuroSc
     const std::string callsign = fp.GetCallsign();
     const ULONGLONG now = GetTickCount64();
 
-    // 5s cache validity
-    auto itSet = routeSetCache.find(callsign);
     auto itTs = routeSetCacheTime.find(callsign);
-    if (itSet != routeSetCache.end() && itTs != routeSetCacheTime.end()) {
-        if (now - itTs->second < 5000) {
-            return itSet->second;
-        }
+    if (itTs != routeSetCacheTime.end() && now - itTs->second < 5000) {
+        auto itSet = routeSetCache.find(callsign);
+        if (itSet != routeSetCache.end()) return itSet->second;
     }
 
     const auto& pts = GetCachedRoutePoints(fp);
@@ -1834,10 +2892,10 @@ const std::unordered_set<std::string>& LOAPlugin::GetCachedRouteSet(const EuroSc
         s.insert(std::move(p));
     }
 
-    routeSetCache[callsign] = std::move(s);
     routeSetCacheTime[callsign] = now;
-
-    return routeSetCache.find(callsign)->second;
+    auto& resultSet = routeSetCache[callsign];
+    resultSet = std::move(s);
+    return resultSet;
 }
 
 // =============================

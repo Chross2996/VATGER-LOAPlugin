@@ -35,11 +35,9 @@ struct LOAEntry {
 	// Custom volume prediction constraints (volumes.json)
 	// - predictedEnterVolumes: match if predicted trajectory enters ANY listed volume
 	// - predictedFromVolumes/predictedToVolumes: match only if it enters a FROM volume and later a TO volume
-	// - predictedEndVolumes: match if the last predicted point ends inside ANY listed volume
 	std::vector<std::string> predictedEnterVolumes;
 	std::vector<std::string> predictedFromVolumes;
 	std::vector<std::string> predictedToVolumes;
-	std::vector<std::string> predictedEndVolumes;
 	std::vector<std::string> originAirports;
 	std::vector<std::string> destinationAirports;
 	std::vector<std::string> nextSectors;
@@ -89,12 +87,13 @@ struct CustomVolume {
 	std::vector<std::pair<double, double>> polygon;
 };
 
-struct CachedTagData {
-	std::string callsign;
-	int clearedAltitude = 0;
-	int finalAltitude = 0;
-	std::string origin;
-	std::string destination;
+struct PerAircraftFrameData {
+	std::string     callsign;
+	std::string     origin;
+	std::string     destination;
+	int             clearedAltitude = 0;
+	int             finalAltitude   = 0;
+	const LOAEntry* matchedEntry    = nullptr;
 };
 
 
@@ -174,7 +173,8 @@ void RenderXFLTagItem(
 	char sItemString[16],
 	int* pColorCode,
 	COLORREF* pRGB,
-	double* pFontSize);
+	double* pFontSize,
+	const PerAircraftFrameData& ctx);
 
 void RenderXFLDetailedTagItem(
 	EuroScopePlugIn::CFlightPlan flightPlan,
@@ -183,7 +183,8 @@ void RenderXFLDetailedTagItem(
 	char sItemString[16],
 	int* pColorCode,
 	COLORREF* pRGB,
-	double* pFontSize);
+	double* pFontSize,
+	const PerAircraftFrameData& ctx);
 
 void RenderCOPTagItem(
 	EuroScopePlugIn::CFlightPlan flightPlan,
@@ -192,7 +193,8 @@ void RenderCOPTagItem(
 	char sItemString[16],
 	int* pColorCode,
 	COLORREF* pRGB,
-	double* pFontSize);
+	double* pFontSize,
+	const PerAircraftFrameData& ctx);
 
 // =============================
 // LOAPlugin Class
@@ -234,6 +236,11 @@ public:
 		const std::vector<std::string>& prefixes,
 		const std::string& airport);
 
+	// Defensive guard for cached LOAEntry pointers.
+	// LOAEntry objects live inside vectors that are rebuilt on JSON reload/sector switch.
+	// Any cached pointer must be verified before it is dereferenced.
+	bool IsLoaEntryPointerValid(const LOAEntry* entry) const;
+
 	// Centralized suppression/gating helpers (shared by matcher + tags)
 	bool ShouldAllowNextSectors(
 		const std::vector<std::string>& nextSectors,
@@ -272,6 +279,8 @@ public:
 	// In class LOAPlugin (LOAPlugin.h)
 	std::unordered_map<std::string, std::vector<const LOAEntry*>> indexByWaypoint;
 	std::unordered_map<std::string, std::vector<const LOAEntry*>> indexByNextSector;
+	// O(1) pointer validity check - rebuilt after every LoadLOAsFromJSON
+	std::unordered_set<const LOAEntry*> validLoaEntryPtrs;
 
 	std::atomic<bool> reloading{ false };
 
@@ -297,7 +306,7 @@ public:
 
 	std::unordered_map<std::string, RenderItemCache> renderCache; // key = callsign + ":" + std::to_string(itemCode)
 
-	CachedTagData lastTagData;
+	PerAircraftFrameData currentFrameRenderData;
 	const std::vector<std::string>& GetCachedRoutePoints(const EuroScopePlugIn::CFlightPlan& fp);
 	const std::unordered_set<std::string>& GetCachedRouteSet(const EuroScopePlugIn::CFlightPlan& fp);
 	std::unordered_map<std::string, const LOAEntry*> matchedLOACache;
@@ -323,6 +332,7 @@ public:
 	std::unordered_map<std::string, CoordinationInfo> coordinationStates;
 
 	void CleanupCache(const std::string& callsign);
+	void PrunePerformanceCaches(ULONGLONG nowMs);
 	virtual void OnFlightPlanStateChange(EuroScopePlugIn::CFlightPlan fp);
 	virtual void OnFlightPlanCoordinationStateChange(EuroScopePlugIn::CFlightPlan fp, int coordinationType, int newState);
 
@@ -368,6 +378,7 @@ public:
 	const std::unordered_map<std::string, CustomVolume>& GetCustomVolumes() const { return customVolumes; }
 private:
 	std::string loadedSector;
+	std::unordered_map<std::string, std::string> lastDestinationByCallsign;
 	void LoadLOAsFromJSON();
 
 	void OnControllerDisconnect(const EuroScopePlugIn::CController& controller);
