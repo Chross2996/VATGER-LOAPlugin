@@ -34,7 +34,8 @@ void RenderCOPTagItem(
     char sItemString[16],
     int* pColorCode,
     COLORREF* pRGB,
-    double* pFontSize)
+    double* pFontSize,
+    const PerAircraftFrameData& ctx)
 {
     const bool isListContext = !radarTarget.IsValid();
 
@@ -59,9 +60,7 @@ void RenderCOPTagItem(
     }
 
     const LOAEntry* matched = plugin.currentFrameMatchedEntry;
-    if (!matched) {
-        matched = MatchLoaEntry(flightPlan, plugin.currentFrameOnlineControllers);
-    }
+    if (matched && !plugin.IsLoaEntryPointerValid(matched)) matched = nullptr;
 
     auto showFallback = [&]() {
         if (matched && !matched->copText.empty() && _stricmp(matched->copText.c_str(), "COPX") != 0) {

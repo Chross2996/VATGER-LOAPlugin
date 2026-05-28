@@ -157,17 +157,6 @@ static int FirstEnterMinuteVolume(const EuroScopePlugIn::CFlightPlan& fp, const 
     return FirstEnterMinuteVolumeFromSamplesLL(samples, vol);
 }
 
-static bool LastPredictedPointInsideVolumeLL(const std::vector<PredSampleLL>& samples, const CustomVolume& vol)
-{
-    if (samples.empty()) return false;
-
-    const PredSampleLL& last = samples.back();
-    if (last.altFt < vol.lowerFt || last.altFt > vol.upperFt)
-        return false;
-
-    return PointInPolyLL(last.lat, last.lon, vol.polygon);
-}
-
 const LOAEntry* MatchLoaEntry(const EuroScopePlugIn::CFlightPlan& fp,
     const std::unordered_set<std::string>& /*onlineControllers*/)
 {
@@ -377,7 +366,6 @@ const LOAEntry* MatchLoaEntry(const EuroScopePlugIn::CFlightPlan& fp,
     //     * from+to: require entering a FROM volume and later a TO volume
     //     * only from: require entering any FROM volume
     //     * only to: require entering any TO volume
-    // - If predictedEndVolumes is set: require the last predicted point to end inside ANY listed volume
 
     // ---------------- Volume prediction caching (performance) ----------------
     // Evaluating volume entry can be expensive (position predictions + geometry).
@@ -413,8 +401,7 @@ const LOAEntry* MatchLoaEntry(const EuroScopePlugIn::CFlightPlan& fp,
         const bool hasEnter = !e->predictedEnterVolumes.empty();
         const bool hasFrom = !e->predictedFromVolumes.empty();
         const bool hasTo = !e->predictedToVolumes.empty();
-        const bool hasEnd = !e->predictedEndVolumes.empty();
-        if (!hasEnter && !hasFrom && !hasTo && !hasEnd) return true; // no constraint
+        if (!hasEnter && !hasFrom && !hasTo) return true; // no constraint
         auto entersAny = [&](const std::vector<std::string>& ids) -> int {
             int bestMinute = INT_MAX;
             for (const auto& id : ids) {
@@ -425,22 +412,6 @@ const LOAEntry* MatchLoaEntry(const EuroScopePlugIn::CFlightPlan& fp,
             }
             return bestMinute;
             };
-
-        auto endsInAny = [&]() -> bool {
-            if (!hasEnd) return true;
-            _ensurePredSamples();
-            for (const auto& id : e->predictedEndVolumes) {
-                const CustomVolume* v = _getVolPtr(id);
-                if (!v) return false; // referenced volume missing -> do NOT match
-                if (LastPredictedPointInsideVolumeLL(_predSamplesLL, *v)) return true;
-            }
-            return false;
-            };
-
-        if (!endsInAny()) return false;
-
-        // Only predictedEndVolumes was defined, and it passed.
-        if (!hasEnter && !hasFrom && !hasTo) return true;
 
         if (hasEnter) {
             // Any enter volume hit is enough
@@ -492,8 +463,7 @@ const LOAEntry* MatchLoaEntry(const EuroScopePlugIn::CFlightPlan& fp,
         if (!e) return false;
         return !e->predictedEnterVolumes.empty()
             || !e->predictedFromVolumes.empty()
-            || !e->predictedToVolumes.empty()
-            || !e->predictedEndVolumes.empty();
+            || !e->predictedToVolumes.empty();
         };
 
     auto isDestinationKind = [&](const LOAEntry* e) -> bool {
